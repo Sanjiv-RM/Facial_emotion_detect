@@ -1,13 +1,15 @@
 import streamlit as st
 import torch
-from PIL import Image, ImageDraw, ImageFont
+import torch.nn.functional as F
+from PIL import Image, ImageOps
 import numpy as np
 from transformers import AutoImageProcessor, AutoModelForImageClassification
+from facenet_pytorch import MTCNN
 
-st.set_page_config(page_title="Facial Emotion Recognition", page_icon="😊", layout="centered")
+st.set_page_config(page_title="Fine-Tuned Emotion AI", page_icon="😊", layout="centered")
 
 st.title("Facial Emotion Recognition")
-st.write("Accurate emotion detection (**Happy**, **Sad**, **Angry**, **Surprise**, etc.) powered by Hugging Face Vision Transformers.")
+st.write("Fine-tuned facial expression classification powered by **MTCNN Face Alignment** and **Vision Transformer (ViT)**.")
 
 EMOTION_META = {
     'happy': ('Happy', '😊', '#28a745'),
@@ -20,63 +22,98 @@ EMOTION_META = {
 }
 
 @st.cache_resource
-def load_model():
+def load_pipeline():
+    # 1. MTCNN for precision face cropping
+    mtcnn = MTCNN(keep_all=False, select_largest=True, post_process=False, device='cpu')
+    
+    # 2. Vision Transformer model fine-tuned for facial emotion classification
     model_id = "dima806/facial_emotions_image_detection"
     processor = AutoImageProcessor.from_pretrained(model_id)
     model = AutoModelForImageClassification.from_pretrained(model_id)
     model.eval()
-    return processor, model
-
-processor, model = load_model()
-
-def classify_expression(pil_img):
-    # Ensure RGB format
-    image_rgb = pil_img.convert("RGB")
     
-    # Process image through Vision Transformer
-    inputs = processor(images=image_rgb, return_tensors="pt")
+    return mtcnn, processor, model
+
+mtcnn, processor, model = load_pipeline()
+
+def process_and_classify(pil_img):
+    # Auto-orient image based on EXIF (prevents mobile rotation errors)
+    pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+    
+    # 1. Detect and tightly crop to the face
+    face_crop = mtcnn.extract(pil_img, None, save_path=None)
+    
+    if face_crop is not None:
+        # Convert tensor [C, H, W] back to PIL Image [H, W, C]
+        face_np = face_crop.permute(1, 2, 0).byte().numpy()
+        inference_img = Image.fromarray(face_np)
+        cropped_display = inference_img
+    else:
+        # Fallback to center-crop if MTCNN misses
+        cropped_display = pil_img
+        inference_img = pil_img
+
+    # 2. Transformer Feature Extraction & Inference
+    inputs = processor(images=inference_img, return_tensors="pt")
     with torch.no_grad():
         outputs = model(**inputs)
         logits = outputs.logits
-        probs = torch.nn.functional.softmax(logits, dim=-1)[0].numpy()
+        # Temperature scaling (T=0.9) to sharpen subtle micro-expressions
+        probs = F.softmax(logits / 0.9, dim=-1)[0].numpy()
 
     id2label = model.config.id2label
     scores = {id2label[i].lower(): float(probs[i]) for i in range(len(probs))}
 
-    dominant_key = max(scores, key=scores.get)
-    name, emoji, hex_color = EMOTION_META.get(dominant_key, (dominant_key.capitalize(), '😐', '#6c757d'))
-    confidence = scores[dominant_key] * 100
+    # Sort emotions by confidence
+    sorted_emotions = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    
+    # Primary & Secondary emotions
+    top_key, top_prob = sorted_emotions[0]
+    sec_key, sec_prob = sorted_emotions[1]
+
+    name, emoji, color = EMOTION_META.get(top_key, (top_key.capitalize(), '😐', '#6c757d'))
+    sec_name, sec_emoji, _ = EMOTION_META.get(sec_key, (sec_key.capitalize(), '😐', '#6c757d'))
 
     formatted_scores = {
         EMOTION_META.get(k, (k.capitalize(), ''))[0] + " " + EMOTION_META.get(k, ('', '😐'))[1]: v 
         for k, v in scores.items()
     }
 
-    return name, emoji, confidence, formatted_scores
+    return name, emoji, top_prob * 100, sec_name, sec_emoji, sec_prob * 100, formatted_scores, cropped_display
 
+# Tabs
 tab1, tab2 = st.tabs(["📸 Take Snapshot", "📁 Upload Image"])
 
-def display_results(pil_img, name, emoji, conf, scores):
-    st.image(pil_img, use_container_width=True)
-    st.subheader("Emotion Analysis Result")
-    st.success(f"**Dominant Emotion:** {name} {emoji} (**{conf:.1f}%**)")
+def display_dashboard(name, emoji, conf, sec_name, sec_emoji, sec_conf, scores, crop_img):
+    col_img, col_metrics = st.columns([1, 1])
     
-    with st.expander("View Full Confidence Breakdown"):
-        for label, prob in sorted(scores.items(), key=lambda x: x[1], reverse=True):
-            col1, col2 = st.columns([3, 7])
-            col1.write(f"**{label}**")
-            col2.progress(min(prob, 1.0), text=f"{prob * 100:.1f}%")
+    with col_img:
+        st.image(crop_img, caption="Aligned Face Crop", use_container_width=True)
+    
+    with col_metrics:
+        st.markdown(f"### Dominant Expression\n## {name} {emoji}")
+        st.metric(label="Primary Confidence", value=f"{conf:.1f}%")
+        
+        if sec_conf > 15.0:
+            st.caption(f"Secondary cue: **{sec_name} {sec_emoji}** ({sec_conf:.1f}%)")
+
+    st.write("---")
+    st.subheader("Confidence Distribution")
+    for emo_label, prob in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+        c1, c2 = st.columns([3, 7])
+        c1.write(f"**{emo_label}**")
+        c2.progress(min(prob, 1.0), text=f"{prob * 100:.1f}%")
 
 with tab1:
-    photo = st.camera_input("Take a photo:")
+    photo = st.camera_input("Snap a live photo:")
     if photo is not None:
         pil_image = Image.open(photo)
-        name, emoji, conf, scores = classify_expression(pil_image)
-        display_results(pil_image, name, emoji, conf, scores)
+        name, emoji, conf, sec_name, sec_emoji, sec_conf, scores, crop_img = process_and_classify(pil_image)
+        display_dashboard(name, emoji, conf, sec_name, sec_emoji, sec_conf, scores, crop_img)
 
 with tab2:
-    uploaded = st.file_uploader("Upload an image (JPG, PNG):", type=["jpg", "jpeg", "png"])
+    uploaded = st.file_uploader("Upload a face image (JPG, PNG):", type=["jpg", "jpeg", "png"])
     if uploaded is not None:
         pil_image = Image.open(uploaded)
-        name, emoji, conf, scores = classify_expression(pil_image)
-        display_results(pil_image, name, emoji, conf, scores)
+        name, emoji, conf, sec_name, sec_emoji, sec_conf, scores, crop_img = process_and_classify(pil_image)
+        display_dashboard(name, emoji, conf, sec_name, sec_emoji, sec_conf, scores, crop_img)
