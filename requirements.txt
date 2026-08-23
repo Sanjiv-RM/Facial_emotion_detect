@@ -1,5 +1,7 @@
 streamlit
 torch
+torchvision
 transformers
+timm
 Pillow
 numpy<2
