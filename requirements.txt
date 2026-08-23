@@ -1,6 +1,5 @@
 streamlit
 streamlit-webrtc
 opencv-python-headless
-deepface
-tf-keras
+fer
 av
