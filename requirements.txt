@@ -1,7 +1,5 @@
 streamlit
-opencv-python-headless==4.10.0.84
-torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
-transformers==4.39.3
-mediapipe==0.10.11
+torch
+transformers
 Pillow
 numpy<2
