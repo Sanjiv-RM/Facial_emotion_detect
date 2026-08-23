@@ -1,5 +1,5 @@
 import os
-import urllib.request
+import requests
 import cv2
 import numpy as np
 import streamlit as st
@@ -7,53 +7,65 @@ import streamlit as st
 st.set_page_config(page_title="Facial Emotion Recognition", page_icon="😊", layout="centered")
 
 st.title("Facial Emotion Recognition")
-st.write("Detect distinct emotions (**Happy**, **Sad**, **Angry**, **Surprise**, etc.) with high sensitivity.")
+st.write("Detect accurate emotions (**Happy**, **Sad**, **Angry**, **Surprise**, **Neutral**, etc.) using a Deep CNN.")
 
-# 7 standard FER emotions
-EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
-EMOTION_EMOJIS = ['😠', '🤢', '😨', '😊', '😢', '😲', '😐']
-EMOTION_COLORS = [
-    (0, 0, 255),    # Angry - Red
-    (0, 140, 255),  # Disgust - Orange
-    (200, 0, 200),  # Fear - Purple
-    (0, 255, 0),    # Happy - Green
-    (255, 100, 0),  # Sad - Blue
-    (255, 255, 0),  # Surprise - Yellow
-    (180, 180, 180) # Neutral - Gray
-]
+# 7 standard FER-2013 emotion classes
+EMOTIONS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+EMOJI_MAP = {
+    'Angry': ('😠', (0, 0, 255)),
+    'Disgust': ('🤢', (0, 140, 255)),
+    'Fear': ('😨', (200, 0, 200)),
+    'Happy': ('😊', (0, 255, 0)),
+    'Sad': ('😢', (255, 100, 0)),
+    'Surprise': ('😲', (255, 255, 0)),
+    'Neutral': ('😐', (180, 180, 180))
+}
 
-# High-accuracy Mini-Xception model for FER-2013
-MODEL_PATH = "facial_emotion_model.onnx"
-MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_extra/master/testdata/dnn/onnx/models/emotion_ferplus.onnx"
+# Pretrained Mini-Xception model weights (FER-2013)
+MODEL_FILE = "emotion_model.onnx"
+MODEL_URL = "https://huggingface.co/trpakov/vit-face-expression/resolve/main/model.onnx"
+BACKUP_URL = "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx"
 
 @st.cache_resource
-def load_models():
+def load_model():
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    return cascade
+    
+    # Download weights if not already present
+    if not os.path.exists(MODEL_FILE):
+        with st.spinner("Downloading trained Deep Neural Network model..."):
+            try:
+                r = requests.get(BACKUP_URL, allow_redirects=True, timeout=30)
+                with open(MODEL_FILE, "wb") as f:
+                    f.write(r.content)
+            except Exception as e:
+                st.error(f"Failed to download model weights: {e}")
+                return None, cascade
 
-face_cascade = load_models()
+    net = cv2.dnn.readNetFromONNX(MODEL_FILE)
+    return net, cascade
 
-def analyze_facial_expression(img_bgr):
+net, face_cascade = load_model()
+
+def classify_expression(img_bgr):
     h_img, w_img = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     
-    # Detect faces
     faces = face_cascade.detectMultiScale(
         gray, 
-        scaleFactor=1.1, 
+        scaleFactor=1.15, 
         minNeighbors=5, 
-        minSize=(60, 60)
+        minSize=(50, 50)
     )
 
     if len(faces) == 0:
         return img_bgr, []
 
-    face_results = []
+    results = []
 
     for (x, y, w, h) in faces:
-        # 1. Expand bounding box by 20% to capture mouth curves, smile lines, and eyebrows
-        margin_x = int(w * 0.20)
-        margin_y = int(h * 0.20)
+        # 10% bounding box expansion to keep jaw and eyebrows intact
+        margin_x = int(w * 0.10)
+        margin_y = int(h * 0.10)
         x1 = max(0, x - margin_x)
         y1 = max(0, y - margin_y)
         x2 = min(w_img, x + w + margin_x)
@@ -63,88 +75,79 @@ def analyze_facial_expression(img_bgr):
         if face_roi.size == 0:
             continue
 
-        # 2. Geometric Expression Feature Extraction (Mouth and Eye aspect analysis)
-        # Smiles expand mouth width and elevate cheek curvature
-        mouth_region = face_roi[int(face_roi.shape[0]*0.60):, int(face_roi.shape[1]*0.20):int(face_roi.shape[1]*0.80)]
-        upper_region = face_roi[:int(face_roi.shape[0]*0.45), :]
+        # Resize to 64x64 input dimension for CNN
+        face_resized = cv2.resize(face_roi, (64, 64))
+        
+        # Standard input normalization
+        blob = cv2.dnn.blobFromImage(
+            face_resized, 
+            scalefactor=1.0, 
+            size=(64, 64), 
+            mean=(0,), 
+            swapRB=False, 
+            crop=False
+        )
 
-        # Normalize lighting
-        face_roi_norm = cv2.equalizeHist(face_roi)
-        face_resized = cv2.resize(face_roi_norm, (48, 48)).astype("float32") / 255.0
+        net.setInput(blob)
+        raw_output = net.forward()[0]
+        
+        # Softmax computation
+        exp_vals = np.exp(raw_output - np.max(raw_output))
+        probs = exp_vals / exp_vals.sum()
 
-        # Heuristic probability vector based on edge and gradient gradients of facial features
-        # Computes sharp curvature in mouth (smile/frown) vs brow furrowing (angry/sad)
-        dx = cv2.Sobel(mouth_region, cv2.CV_64F, 1, 0, ksize=3)
-        dy = cv2.Sobel(mouth_region, cv2.CV_64F, 0, 1, ksize=3)
-        mouth_gradient = np.mean(np.abs(dx)) + np.mean(np.abs(dy))
+        # Map predictions
+        # Model output order: [Neutral, Happiness, Surprise, Sadness, Anger, Disgust, Fear, Contempt]
+        model_classes = ['Neutral', 'Happy', 'Surprise', 'Sadness', 'Angry', 'Disgust', 'Fear', 'Neutral']
+        
+        emotion_scores = {}
+        for cls_name, prob in zip(model_classes, probs):
+            emotion_scores[cls_name] = emotion_scores.get(cls_name, 0.0) + float(prob)
 
-        brow_dx = cv2.Sobel(upper_region, cv2.CV_64F, 1, 0, ksize=3)
-        brow_gradient = np.mean(np.abs(brow_dx))
+        # Determine dominant emotion
+        dominant_emotion = max(emotion_scores, key=emotion_scores.get)
+        confidence = emotion_scores[dominant_emotion] * 100
+        emoji, color = EMOJI_MAP.get(dominant_emotion, ('😐', (0, 255, 0)))
 
-        # Dynamic scoring weights
-        scores = np.array([0.10, 0.05, 0.08, 0.15, 0.12, 0.10, 0.40]) # Base FER distribution
-
-        # Mouth expansion heuristic for smiling (Happy)
-        if mouth_gradient > 25.0:
-            scores[3] += (mouth_gradient / 20.0) * 0.6  # Boost Happy
-            scores[6] *= 0.35  # Strongly penalize Neutral
-
-        # Brow furrowing heuristic (Angry / Sad)
-        if brow_gradient > 30.0:
-            scores[0] += 0.35  # Boost Angry
-            scores[4] += 0.30  # Boost Sad
-            scores[6] *= 0.40  # Suppress Neutral
-
-        # Softmax normalization
-        exp_s = np.exp(scores - np.max(scores))
-        probs = exp_s / exp_s.sum()
-
-        top_idx = int(np.argmax(probs))
-        label_text = EMOTION_LABELS[top_idx]
-        emoji = EMOTION_EMOJIS[top_idx]
-        color = EMOTION_COLORS[top_idx]
-        conf = probs[top_idx] * 100
-
-        # Draw bounding box & badge
+        # Draw bounding box and label
         cv2.rectangle(img_bgr, (x, y), (x + w, y + h), color, 3)
-        badge = f"{label_text} {emoji} ({conf:.0f}%)"
-        cv2.putText(img_bgr, badge, (x, max(y - 12, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA)
+        tag = f"{dominant_emotion} {emoji} ({confidence:.0f}%)"
+        cv2.putText(img_bgr, tag, (x, max(y - 10, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
-        breakdown = {f"{EMOTION_LABELS[i]} {EMOTION_EMOJIS[i]}": float(probs[i]) for i in range(len(EMOTION_LABELS))}
-        face_results.append((label_text, emoji, conf, breakdown))
+        results.append((dominant_emotion, emoji, confidence, emotion_scores))
 
-    return img_bgr, face_results
+    return img_bgr, results
 
-# Interface
+# Tabs
 tab1, tab2 = st.tabs(["📸 Take Snapshot", "📁 Upload Image"])
 
-def render_predictions(img, results):
+def display_dashboard(img, results):
     st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
     if not results:
-        st.warning("No face detected. Please ensure you are facing the camera in good lighting.")
+        st.warning("No face detected. Please ensure proper front lighting and face the camera directly.")
         return
 
-    st.subheader("Results")
-    for i, (name, emoji, conf, dist) in enumerate(results):
+    st.subheader("Detected Facial Expressions")
+    for i, (name, emoji, conf, scores) in enumerate(results):
         st.success(f"**Face #{i+1}:** {name} {emoji} (**{conf:.1f}%**)")
         with st.expander(f"Full Probability Distribution (Face #{i+1})"):
-            for emo_lbl, prob in sorted(dist.items(), key=lambda x: x[1], reverse=True):
+            for emo_name, prob in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+                emoji_icon, _ = EMOJI_MAP.get(emo_name, ('😐', ()))
                 col1, col2 = st.columns([3, 7])
-                col1.write(f"**{emo_lbl}**")
+                col1.write(f"**{emo_name} {emoji_icon}**")
                 col2.progress(min(prob, 1.0), text=f"{prob*100:.1f}%")
 
 with tab1:
-    camera_pic = st.camera_input("Snap a live photo:")
-    if camera_pic is not None:
-        file_bytes = np.asarray(bytearray(camera_pic.read()), dtype=np.uint8)
+    cam_shot = st.camera_input("Take a photo:")
+    if cam_shot is not None:
+        file_bytes = np.asarray(bytearray(cam_shot.read()), dtype=np.uint8)
         img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        annotated_img, results = analyze_facial_expression(img_bgr)
-        render_predictions(annotated_img, results)
+        annotated_img, results = classify_expression(img_bgr)
+        display_dashboard(annotated_img, results)
 
 with tab2:
-    uploaded = st.file_uploader("Upload a portrait/selfie:", type=["jpg", "jpeg", "png"])
+    uploaded = st.file_uploader("Upload an image (JPG, PNG):", type=["jpg", "jpeg", "png"])
     if uploaded is not None:
         file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
         img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        annotated_img, results = analyze_facial_expression(img_bgr)
-        render_predictions(annotated_img, results)
+        annotated_img, results = classify_expression(img_bgr)
+        display_dashboard(annotated_img, results)
