@@ -1,8 +1,5 @@
 streamlit
+transformers
 torch
 torchvision
-transformers
-timm
-facenet-pytorch
 Pillow
-numpy<2
