@@ -1,151 +1,131 @@
-import os
-import requests
 import cv2
 import numpy as np
 import streamlit as st
+import torch
+from PIL import Image
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+import mediapipe as mp
 
-st.set_page_config(page_title="Facial Emotion Recognition", page_icon="😊", layout="centered")
+st.set_page_config(page_title="Accurate Facial Emotion Recognition", page_icon="😊", layout="centered")
 
 st.title("Facial Emotion Recognition")
-st.write("Detect distinct emotions (**Happy**, **Sad**, **Angry**, **Surprise**, etc.) with calibrated sensitivity.")
+st.write("Powered by **MediaPipe Landmark Face Tracking** and **HuggingFace Vision Transformers (ViT)** for high accuracy.")
 
-EMOTION_INFO = {
-    'Angry': ('😠', (0, 0, 255)),
-    'Disgust': ('🤢', (0, 140, 255)),
-    'Fear': ('😨', (200, 0, 200)),
-    'Happy': ('😊', (0, 255, 0)),
-    'Sad': ('😢', (255, 120, 0)),
-    'Surprise': ('😲', (255, 255, 0)),
-    'Neutral': ('😐', (180, 180, 180))
+EMOTION_META = {
+    'happy': ('Happy', '😊', (0, 255, 0)),
+    'sad': ('Sad', '😢', (255, 120, 0)),
+    'angry': ('Angry', '😠', (0, 0, 255)),
+    'surprise': ('Surprise', '😲', (255, 255, 0)),
+    'fear': ('Fear', '😨', (200, 0, 200)),
+    'disgust': ('Disgust', '🤢', (0, 140, 255)),
+    'neutral': ('Neutral', '😐', (180, 180, 180))
 }
 
-MODEL_FILE = "emotion_ferplus.onnx"
-MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx"
-
 @st.cache_resource
-def load_model():
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    if not os.path.exists(MODEL_FILE):
-        with st.spinner("Downloading emotion classifier..."):
-            r = requests.get(MODEL_URL, timeout=30)
-            with open(MODEL_FILE, "wb") as f:
-                f.write(r.content)
-    net = cv2.dnn.readNetFromONNX(MODEL_FILE)
-    return net, cascade
+def load_models():
+    # Hugging Face ViT model fine-tuned specifically on facial emotions
+    model_id = "dima806/facial_emotions_image_detection"
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModelForImageClassification.from_pretrained(model_id)
+    model.eval()
 
-net, face_cascade = load_model()
-
-def classify_face(img_bgr):
-    h_img, w_img = img_bgr.shape[:2]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    
-    # Detect face
-    faces = face_cascade.detectMultiScale(
-        gray, 
-        scaleFactor=1.12, 
-        minNeighbors=5, 
-        minSize=(50, 50)
+    # MediaPipe Face Detection for tight, accurate face bounding boxes
+    mp_face_detection = mp.solutions.face_detection.FaceDetection(
+        model_selection=1, 
+        min_detection_confidence=0.5
     )
+    return processor, model, mp_face_detection
 
-    if len(faces) == 0:
+processor, model, face_detector = load_models()
+
+def analyze_facial_emotions(img_bgr):
+    h, w, _ = img_bgr.shape
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    detection_results = face_detector.process(img_rgb)
+
+    if not detection_results.detections:
         return img_bgr, []
 
     results = []
 
-    for (x, y, w, h) in faces:
-        # Include brow and chin margins
-        margin_x = int(w * 0.12)
-        margin_y = int(h * 0.15)
-        x1 = max(0, x - margin_x)
-        y1 = max(0, y - margin_y)
-        x2 = min(w_img, x + w + margin_x)
-        y2 = min(h_img, y + h + margin_y)
+    for detection in detection_results.detections:
+        bbox = detection.location_data.relative_bounding_box
+        
+        # Convert relative coordinates to pixel values
+        x = int(bbox.xmin * w)
+        y = int(bbox.ymin * h)
+        bw = int(bbox.width * w)
+        bh = int(bbox.height * h)
 
-        face_roi = gray[y1:y2, x1:x2]
-        if face_roi.size == 0:
+        # Margin expansion to preserve chin, forehead, and cheek curves
+        mx = int(bw * 0.10)
+        my = int(bh * 0.10)
+        x1 = max(0, x - mx)
+        y1 = max(0, y - my)
+        x2 = min(w, x + bw + mx)
+        y2 = min(h, y + bh + my)
+
+        face_crop = img_rgb[y1:y2, x1:x2]
+        if face_crop.size == 0:
             continue
 
-        # Contrast normalization
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        face_enhanced = clahe.apply(face_roi)
-        face_resized = cv2.resize(face_enhanced, (64, 64))
+        # Convert crop to PIL for Vision Transformer inference
+        pil_face = Image.fromarray(face_crop)
+        inputs = processor(images=pil_face, return_tensors="pt")
 
-        # Prepare blob
-        blob = cv2.dnn.blobFromImage(
-            face_resized, 
-            scalefactor=1.0, 
-            size=(64, 64), 
-            mean=(0,), 
-            swapRB=False, 
-            crop=False
-        )
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.nn.functional.softmax(logits, dim=-1)[0].numpy()
 
-        net.setInput(blob)
-        raw_logits = net.forward()[0]
-        
-        # Raw classes from FERPlus ONNX:
-        # [0: neutral, 1: happiness, 2: surprise, 3: sadness, 4: anger, 5: disgust, 6: fear, 7: contempt]
-        
-        # Calibrate logits: Penalize neutral bias and boost subtle micro-expression logits
-        calibrated_logits = np.copy(raw_logits)
-        calibrated_logits[0] -= 1.4   # Neutral penalty
-        calibrated_logits[3] += 0.8   # Sad boost
-        calibrated_logits[4] += 0.7   # Anger boost
-        calibrated_logits[1] += 0.3   # Happy adjustment
+        id2label = model.config.id2label
+        raw_scores = {id2label[i].lower(): float(probs[i]) for i in range(len(probs))}
 
-        # Softmax probability conversion
-        exp_vals = np.exp(calibrated_logits - np.max(calibrated_logits))
-        probs = exp_vals / exp_vals.sum()
+        # Determine dominant prediction
+        dominant_key = max(raw_scores, key=raw_scores.get)
+        label_name, emoji, color = EMOTION_META.get(dominant_key, (dominant_key.capitalize(), '😐', (0, 255, 0)))
+        confidence = raw_scores[dominant_key] * 100
 
-        class_names = ['Neutral', 'Happy', 'Surprise', 'Sad', 'Angry', 'Disgust', 'Fear', 'Neutral']
-        
-        emotion_probs = {}
-        for name, p in zip(class_names, probs):
-            emotion_probs[name] = emotion_probs.get(name, 0.0) + float(p)
+        # Draw bounding box and label badge
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 3)
+        badge = f"{label_name} {emoji} ({confidence:.0f}%)"
+        cv2.putText(img_bgr, badge, (x1, max(y1 - 10, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA)
 
-        dominant_emotion = max(emotion_probs, key=emotion_probs.get)
-        confidence = emotion_probs[dominant_emotion] * 100
-        emoji, color = EMOTION_INFO.get(dominant_emotion, ('😐', (0, 255, 0)))
-
-        # Draw bounding box and label
-        cv2.rectangle(img_bgr, (x, y), (x + w, y + h), color, 3)
-        tag = f"{dominant_emotion} {emoji} ({confidence:.0f}%)"
-        cv2.putText(img_bgr, tag, (x, max(y - 10, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-
-        results.append((dominant_emotion, emoji, confidence, emotion_probs))
+        formatted_scores = {EMOTION_META.get(k, (k.capitalize(), ''))[0] + " " + EMOTION_META.get(k, ('', '😐'))[1]: v for k, v in raw_scores.items()}
+        results.append((label_name, emoji, confidence, formatted_scores))
 
     return img_bgr, results
 
+# UI
 tab1, tab2 = st.tabs(["📸 Take Snapshot", "📁 Upload Image"])
 
-def display_dashboard(img, results):
-    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
+def display_dashboard(img_bgr, results):
+    st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
     if not results:
-        st.warning("No face detected. Please ensure your face is well-lit and facing the camera directly.")
+        st.warning("No face detected. Please face the camera directly in clear lighting.")
         return
 
-    st.subheader("Detected Facial Expressions")
+    st.subheader("Emotion Analysis Output")
     for i, (name, emoji, conf, scores) in enumerate(results):
         st.success(f"**Face #{i+1}:** {name} {emoji} (**{conf:.1f}%**)")
-        with st.expander(f"Full Probability Distribution (Face #{i+1})"):
-            for emo_name, prob in sorted(scores.items(), key=lambda x: x[1], reverse=True):
-                emoji_icon, _ = EMOTION_INFO.get(emo_name, ('😐', ()))
+        with st.expander(f"Full Confidence Breakdown (Face #{i+1})"):
+            for emo_label, score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
                 col1, col2 = st.columns([3, 7])
-                col1.write(f"**{emo_name} {emoji_icon}**")
-                col2.progress(min(prob, 1.0), text=f"{prob*100:.1f}%")
+                col1.write(f"**{emo_label}**")
+                col2.progress(min(score, 1.0), text=f"{score*100:.1f}%")
 
 with tab1:
-    cam_shot = st.camera_input("Take a snapshot:")
-    if cam_shot is not None:
-        file_bytes = np.asarray(bytearray(cam_shot.read()), dtype=np.uint8)
+    camera_file = st.camera_input("Snap a live photo:")
+    if camera_file is not None:
+        file_bytes = np.asarray(bytearray(camera_file.read()), dtype=np.uint8)
         img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        annotated_img, results = classify_face(img_bgr)
-        display_dashboard(annotated_img, results)
+        annotated, results = analyze_facial_emotions(img_bgr)
+        display_dashboard(annotated, results)
 
 with tab2:
-    uploaded = st.file_uploader("Upload an image (JPG, PNG):", type=["jpg", "jpeg", "png"])
+    uploaded = st.file_uploader("Upload a face image (JPG/PNG):", type=["jpg", "jpeg", "png"])
     if uploaded is not None:
         file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
         img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        annotated_img, results = classify_face(img_bgr)
-        display_dashboard(annotated_img, results)
+        annotated, results = analyze_facial_emotions(img_bgr)
+        display_dashboard(annotated, results)
